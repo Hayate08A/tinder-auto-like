@@ -1,0 +1,464 @@
+/*
+ * Tinderプロフィール自動判定（iPhone・PC共通）
+ *
+ * iPhoneショートカット:
+ * 1. 「40回繰り返す」を追加
+ * 2. 繰り返し内の「WebページでJavaScriptを実行」に
+ *    このファイル全体を貼り付ける
+ * 3. 入力を「ショートカットの入力（Safari Webページ）」に指定
+ * 4. JavaScriptの直後に「0.5秒待機」を追加
+ *
+ * PC:
+ * Tinderを開いたブラウザのConsoleへ、このファイル全体を貼り付ける。
+ * 3000ms間隔で開始し、最大777人を判定すると停止する。
+ *
+ * PC操作:
+ * tinderAutoJudge.status()       状態確認
+ * tinderAutoJudge.stop()         停止
+ * tinderAutoJudge.start()        再開
+ * tinderAutoJudge.resetHistory() 判定済み履歴の消去
+ */
+
+(() => {
+  const CONFIG = Object.freeze({
+    maxDistanceKm: 30,
+    ngKeywords: ["女装", "ゲイ", "ホモ"],
+    maxProfiles: 777,
+    intervalMs: 3000,
+    newRunAfterMs: 5000,
+  });
+
+  const STORAGE = Object.freeze({
+    seen: "tinderAutoJudge.seenProfiles",
+    decisions: "tinderAutoJudge.currentRunDecisions",
+    log: "tinderAutoJudge.currentRunLog",
+    lastStepAt: "tinderAutoJudge.lastStepAt",
+  });
+
+  const DISTANCE_PATTERN = /^(\d[\d,]*(?:\.\d+)?)\s*km\s*先$/i;
+
+  const OBFUSCATION_SEPARATOR_PATTERN = /[\p{P}\p{S}\p{Z}\p{Cf}\s_ー]+/gu;
+
+  const LATIN_LINE_PATTERN =
+    /(?:^|[^a-z0-9])l[\p{P}\p{S}\p{Z}\p{Cf}\s_]*i[\p{P}\p{S}\p{Z}\p{Cf}\s_]*n[\p{P}\p{S}\p{Z}\p{Cf}\s_]*e(?=$|[^a-z0-9])/iu;
+
+  const SMALL_HIRAGANA_MAP = Object.freeze({
+    ぁ: "あ",
+    ぃ: "い",
+    ぅ: "う",
+    ぇ: "え",
+    ぉ: "お",
+    っ: "つ",
+    ゃ: "や",
+    ゅ: "ゆ",
+    ょ: "よ",
+    ゎ: "わ",
+  });
+
+  function normalizeText(value) {
+    return String(value ?? "")
+      .normalize("NFKC")
+      .toLocaleLowerCase("ja-JP")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function katakanaToHiragana(value) {
+    return value.replace(/[\u30A1-\u30F6]/g, (character) =>
+      String.fromCharCode(character.charCodeAt(0) - 0x60),
+    );
+  }
+
+  function normalizeKanaForObfuscatedMatching(value) {
+    return katakanaToHiragana(normalizeText(value))
+      .replace(
+        /[ぁぃぅぇぉっゃゅょゎ]/g,
+        (character) => SMALL_HIRAGANA_MAP[character] || character,
+      )
+      .replace(OBFUSCATION_SEPARATOR_PATTERN, "");
+  }
+
+  function containsLineMention(value) {
+    const normalized = normalizeText(value);
+    const normalizedKana = normalizeKanaForObfuscatedMatching(normalized);
+
+    return (
+      normalizedKana.includes("らいん") || LATIN_LINE_PATTERN.test(normalized)
+    );
+  }
+
+  function parseDistanceTexts(values) {
+    const distances = [];
+
+    for (const value of values) {
+      const match = normalizeText(value).match(DISTANCE_PATTERN);
+      if (!match) continue;
+
+      const distance = Number(match[1].replaceAll(",", ""));
+      if (Number.isFinite(distance)) distances.push(distance);
+    }
+
+    return [...new Set(distances)];
+  }
+
+  function evaluateRules({
+    profileText,
+    distanceKm,
+    maxDistanceKm = CONFIG.maxDistanceKm,
+    ngKeywords = CONFIG.ngKeywords,
+  }) {
+    const normalizedProfile = normalizeText(profileText);
+    const reasons = [];
+
+    if (distanceKm !== null && distanceKm >= maxDistanceKm) {
+      reasons.push({
+        type: "distance",
+        value: distanceKm,
+        message: `${distanceKm}km先（${maxDistanceKm}km以上）`,
+      });
+    }
+
+    for (const keyword of ngKeywords) {
+      const normalizedKeyword = normalizeText(keyword);
+
+      if (normalizedKeyword && normalizedProfile.includes(normalizedKeyword)) {
+        reasons.push({
+          type: "keyword",
+          value: keyword,
+          message: `NG文字列「${keyword}」`,
+        });
+      }
+    }
+
+    if (containsLineMention(profileText)) {
+      reasons.push({
+        type: "line",
+        message: "LINEへの言及",
+      });
+    }
+
+    return {
+      action: reasons.length > 0 ? "Nope" : "Like",
+      reasons,
+    };
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      CONFIG,
+      normalizeText,
+      normalizeKanaForObfuscatedMatching,
+      containsLineMention,
+      parseDistanceTexts,
+      evaluateRules,
+    };
+  }
+
+  if (typeof document === "undefined") return;
+
+  function isSuppressed(element) {
+    return Boolean(
+      element.closest('[aria-hidden="true"], [inert], .Hidden, script, style'),
+    );
+  }
+
+  function readJsonArray(key) {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(key) || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function resetCurrentRun() {
+    sessionStorage.setItem(STORAGE.decisions, "0");
+    sessionStorage.setItem(STORAGE.log, "[]");
+    sessionStorage.setItem(STORAGE.lastStepAt, String(Date.now()));
+  }
+
+  function ensureCurrentRun() {
+    const now = Date.now();
+    const previous = Number(sessionStorage.getItem(STORAGE.lastStepAt) || "0");
+
+    if (previous === 0 || now - previous > CONFIG.newRunAfterMs) {
+      resetCurrentRun();
+    } else {
+      sessionStorage.setItem(STORAGE.lastStepAt, String(now));
+    }
+  }
+
+  function getOpenedProfile() {
+    return document.querySelector("main .profileContent");
+  }
+
+  function hasDetailMarkers(profile) {
+    const markers = new Set(["基本情報", "求めるものは"]);
+
+    return [...profile.querySelectorAll("h1, h2, h3")]
+      .filter((element) => !isSuppressed(element))
+      .some((element) => markers.has(element.textContent.trim()));
+  }
+
+  function getProfileId(profile) {
+    const photos = [...profile.querySelectorAll('[style*="background-image"]')];
+
+    for (const photo of photos) {
+      const backgroundImage = photo.style.backgroundImage || "";
+      const match = backgroundImage.match(/\/u\/([^/)"?]+)/);
+
+      if (match) return match[1];
+    }
+
+    return null;
+  }
+
+  function getProfileName(profile) {
+    return (
+      profile
+        .querySelector("h1[aria-label]")
+        ?.getAttribute("aria-label")
+        ?.replace(/\s+\d+歳$/, "")
+        .trim() ||
+      profile.querySelector("h1 span")?.textContent.trim() ||
+      "不明"
+    );
+  }
+
+  function getProfileText(profile) {
+    const texts = [];
+    const walker = document.createTreeWalker(profile, NodeFilter.SHOW_TEXT);
+
+    let node;
+    while ((node = walker.nextNode())) {
+      const parent = node.parentElement;
+      if (!parent || isSuppressed(parent)) continue;
+
+      const text = normalizeText(node.nodeValue);
+      if (text) texts.push(text);
+    }
+
+    return texts.join(" ");
+  }
+
+  function getDistances(profile) {
+    const values = [...profile.querySelectorAll("div, span, p, li")]
+      .filter(
+        (element) => element.children.length === 0 && !isSuppressed(element),
+      )
+      .map((element) => element.textContent);
+
+    return parseDistanceTexts(values);
+  }
+
+  function findButton(labelText) {
+    const label = [...document.querySelectorAll("span.Hidden")].find(
+      (element) => {
+        const button = element.closest("button");
+
+        return (
+          element.textContent.trim() === labelText &&
+          button &&
+          !button.disabled &&
+          !isSuppressed(button)
+        );
+      },
+    );
+
+    return label?.closest("button") || null;
+  }
+
+  function appendLog(entry) {
+    const log = readJsonArray(STORAGE.log);
+    log.push(entry);
+    sessionStorage.setItem(STORAGE.log, JSON.stringify(log.slice(-100)));
+  }
+
+  function runStep() {
+    try {
+      ensureCurrentRun();
+
+      const decisionCount = Number(
+        sessionStorage.getItem(STORAGE.decisions) || "0",
+      );
+
+      if (decisionCount >= CONFIG.maxProfiles) {
+        return {
+          status: "limit",
+          message: `上限${CONFIG.maxProfiles}人に到達しました`,
+          decisionCount,
+        };
+      }
+
+      const profile = getOpenedProfile();
+
+      // 詳細が閉じているときは、この呼び出しでは開くだけ。
+      if (!profile) {
+        const openButton = findButton("プロフィールを開く");
+
+        if (!openButton) {
+          return {
+            status: "waiting",
+            message: "操作可能な「プロフィールを開く」が見つかりません",
+          };
+        }
+
+        openButton.click();
+
+        return {
+          status: "opened",
+          message: "プロフィールを開きました",
+          decisionCount,
+        };
+      }
+
+      if (!hasDetailMarkers(profile)) {
+        return {
+          status: "waiting",
+          message: "プロフィール詳細の読み込み待ちです",
+          decisionCount,
+        };
+      }
+
+      const profileId = getProfileId(profile);
+      const profileName = getProfileName(profile);
+
+      if (!profileId) {
+        return {
+          status: "waiting",
+          message: "プロフィールIDを取得できません",
+          profileName,
+          decisionCount,
+        };
+      }
+
+      const seenProfiles = new Set(readJsonArray(STORAGE.seen));
+
+      if (seenProfiles.has(profileId)) {
+        return {
+          status: "duplicate",
+          message: "判定済みのプロフィールです",
+          profileId,
+          profileName,
+          decisionCount,
+        };
+      }
+
+      const distances = getDistances(profile);
+
+      if (distances.length > 1) {
+        return {
+          status: "error",
+          message: "異なる距離表示が複数見つかりました",
+          distances,
+          profileId,
+          profileName,
+          decisionCount,
+        };
+      }
+
+      const distanceKm = distances[0] ?? null;
+      const decision = evaluateRules({
+        profileText: getProfileText(profile),
+        distanceKm,
+      });
+      const button = findButton(decision.action);
+
+      if (!button) {
+        return {
+          status: "waiting",
+          message: `${decision.action}ボタンが見つかりません`,
+          distanceKm,
+          reasons: decision.reasons,
+          profileId,
+          profileName,
+          decisionCount,
+        };
+      }
+
+      const nextCount = decisionCount + 1;
+      const result = {
+        status: decision.action === "Nope" ? "clicked-nope" : "clicked-like",
+        action: decision.action,
+        distanceKm,
+        reasons: decision.reasons,
+        profileId,
+        profileName,
+        decisionCount: nextCount,
+      };
+
+      // クリック前に保存し、連続実行による二重押下を防止する。
+      seenProfiles.add(profileId);
+      sessionStorage.setItem(STORAGE.seen, JSON.stringify([...seenProfiles]));
+      sessionStorage.setItem(STORAGE.decisions, String(nextCount));
+      appendLog(result);
+
+      button.click();
+      return result;
+    } catch (error) {
+      return {
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  const isIPhoneShortcut = typeof completion === "function";
+
+  if (isIPhoneShortcut) {
+    // ショートカットでは1ステップだけ実行し、即座に完了する。
+    completion(JSON.stringify(runStep()));
+    return;
+  }
+
+  // PCコンソールでは同じコードが自動反復する。
+  window.tinderAutoJudge?.stop?.();
+  resetCurrentRun();
+
+  const controller = {
+    timer: null,
+    lastResult: null,
+
+    start() {
+      if (this.timer) return;
+
+      const tick = () => {
+        this.lastResult = runStep();
+        console.log("[Tinder Auto Judge]", this.lastResult);
+
+        if (this.lastResult.status === "limit") {
+          this.stop();
+        }
+      };
+
+      tick();
+      this.timer = window.setInterval(tick, CONFIG.intervalMs);
+    },
+
+    stop() {
+      if (this.timer) {
+        window.clearInterval(this.timer);
+        this.timer = null;
+      }
+      console.log("[Tinder Auto Judge] stopped");
+    },
+
+    status() {
+      return {
+        running: Boolean(this.timer),
+        decisionCount: Number(sessionStorage.getItem(STORAGE.decisions) || "0"),
+        seenProfiles: readJsonArray(STORAGE.seen).length,
+        lastResult: this.lastResult,
+      };
+    },
+
+    resetHistory() {
+      sessionStorage.removeItem(STORAGE.seen);
+      console.log("[Tinder Auto Judge] 判定済み履歴を消去しました");
+    },
+  };
+
+  window.tinderAutoJudge = controller;
+  controller.start();
+})();
