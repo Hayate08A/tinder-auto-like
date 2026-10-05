@@ -10,7 +10,10 @@
  *
  * PC:
  * Tinderを開いたブラウザのConsoleへ、このファイル全体を貼り付ける。
- * 3000ms間隔で開始し、最大777人を判定すると停止する。
+ * 設定した間隔で判定を続ける。停止は tinderAutoJudge.stop() で行う。
+ *
+ * メンバーがいない画面では次のカテゴリーへ移動します。
+ * 一覧の最後のカテゴリーの次は最初へ戻ります。
  *
  * PC操作:
  * tinderAutoJudge.status()       状態確認
@@ -21,14 +24,28 @@
 
 (() => {
   const CONFIG = Object.freeze({
-    maxDistanceKm: 30,
-    ngKeywords: ["女装", "ゲイ", "ホモ"],
-    maxProfiles: 777,
-    intervalMs: 3000,
-    newRunAfterMs: 5000,
+    maxDistanceKm: 69,
+    ngKeywords: [
+      "男の娘",
+      "ゲイ",
+      "ホモ",
+      "らいん",
+      "ら い ん",
+      "ら-い-ん",
+      "ライン",
+      "ラ-イ-ン ",
+      "ラ イ ン",
+    ],
+    blockLineMentions: false,
+    intervalMs: 1500,
+    profileOpenFallbackAfterMs: 3000,
+    profileLoadingRotationThreshold: 5,
+    categoryTransitionWaitMs: 4000,
+    newRunAfterMs: 200,
   });
 
   const STORAGE = Object.freeze({
+    categoryRotation: "tinderAutoJudge.categoryRotation.v2",
     seen: "tinderAutoJudge.seenProfiles",
     decisions: "tinderAutoJudge.currentRunDecisions",
     log: "tinderAutoJudge.currentRunLog",
@@ -82,9 +99,14 @@
   function containsLineMention(value) {
     const normalized = normalizeText(value);
     const normalizedKana = normalizeKanaForObfuscatedMatching(normalized);
+    const normalizedKanaWithoutOnline = normalizedKana.replace(
+      /おんらいん/g,
+      "",
+    );
 
     return (
-      normalizedKana.includes("らいん") || LATIN_LINE_PATTERN.test(normalized)
+      normalizedKanaWithoutOnline.includes("らいん") ||
+      LATIN_LINE_PATTERN.test(normalized)
     );
   }
 
@@ -107,8 +129,10 @@
     distanceKm,
     maxDistanceKm = CONFIG.maxDistanceKm,
     ngKeywords = CONFIG.ngKeywords,
+    blockLineMentions = CONFIG.blockLineMentions,
   }) {
     const normalizedProfile = normalizeText(profileText);
+    const lineMentionDetected = containsLineMention(profileText);
     const reasons = [];
 
     if (distanceKm !== null && distanceKm >= maxDistanceKm) {
@@ -131,7 +155,7 @@
       }
     }
 
-    if (containsLineMention(profileText)) {
+    if (blockLineMentions && lineMentionDetected) {
       reasons.push({
         type: "line",
         message: "LINEへの言及",
@@ -141,6 +165,61 @@
     return {
       action: reasons.length > 0 ? "Nope" : "Like",
       reasons,
+      lineMentionDetected,
+    };
+  }
+
+  function formatNopeReason(reason) {
+    if (reason.type === "distance") {
+      return `判定距離外（${reason.message}）`;
+    }
+
+    if (reason.type === "line") {
+      return "LINE誘導";
+    }
+
+    return reason.message;
+  }
+
+  function createLineMentionProfileLog({
+    profileId,
+    profileName,
+    profileText,
+    distanceKm,
+  }) {
+    return {
+      profileId,
+      profileName,
+      distanceKm,
+      profileText,
+      capturedAt: new Date().toISOString(),
+    };
+  }
+
+  function createDecisionLogFields({
+    action,
+    profileName,
+    distanceKm,
+    reasonLabels,
+  }) {
+    const isLike = action === "Like";
+    const emoji = isLike ? "❤️" : "❌";
+    const displayAction = isLike ? "LIKE" : "NOPE";
+    const normalizedReasons = reasonLabels.length > 0 ? reasonLabels : ["なし"];
+    const distanceLabel =
+      distanceKm === null || distanceKm === undefined
+        ? "距離不明"
+        : `${distanceKm}km`;
+    const summary =
+      `${emoji} ${displayAction}｜${profileName}｜${distanceLabel}｜` +
+      `理由: ${normalizedReasons.join("・")}`;
+
+    return {
+      emoji,
+      displayAction,
+      reasonLabels: normalizedReasons,
+      summary,
+      message: summary,
     };
   }
 
@@ -157,6 +236,24 @@
 
   if (typeof document === "undefined") return;
 
+  let profileOpenMissingSince = 0;
+  let profileLoadingConsecutiveCount = 0;
+  let lastProcessedProfileId = null;
+  const profileIdsInCurrentCategory = new Set();
+  const fallbackClickedAriaLabels = new Set();
+  // Safariショートカットは毎回コードを実行し直すので、遷移状態を保存する。
+  function readCategoryRotation() {
+    try {
+      return JSON.parse(sessionStorage.getItem(STORAGE.categoryRotation)) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveCategoryRotation(state) {
+    sessionStorage.setItem(STORAGE.categoryRotation, JSON.stringify(state));
+  }
+
   function isSuppressed(element) {
     return Boolean(
       element.closest('[aria-hidden="true"], [inert], .Hidden, script, style'),
@@ -169,6 +266,35 @@
       return Array.isArray(value) ? value : [];
     } catch {
       return [];
+    }
+  }
+
+  function readSeenProfiles() {
+    const sessionProfiles = readJsonArray(STORAGE.seen);
+
+    try {
+      const localValue = JSON.parse(localStorage.getItem(STORAGE.seen) || "[]");
+      const localProfiles = Array.isArray(localValue) ? localValue : [];
+      const mergedProfiles = [
+        ...new Set([...localProfiles, ...sessionProfiles]),
+      ];
+
+      localStorage.setItem(STORAGE.seen, JSON.stringify(mergedProfiles));
+      sessionStorage.removeItem(STORAGE.seen);
+      return mergedProfiles;
+    } catch {
+      return sessionProfiles;
+    }
+  }
+
+  function writeSeenProfiles(profiles) {
+    const serialized = JSON.stringify([...profiles]);
+
+    try {
+      localStorage.setItem(STORAGE.seen, serialized);
+      sessionStorage.removeItem(STORAGE.seen);
+    } catch {
+      sessionStorage.setItem(STORAGE.seen, serialized);
     }
   }
 
@@ -252,21 +378,404 @@
     return parseDistanceTexts(values);
   }
 
-  function findButton(labelText) {
-    const label = [...document.querySelectorAll("span.Hidden")].find(
-      (element) => {
-        const button = element.closest("button");
+  function isEnabledActionElement(element) {
+    return Boolean(
+      element &&
+      !element.disabled &&
+      element.getAttribute("aria-disabled") !== "true" &&
+      !isSuppressed(element),
+    );
+  }
 
-        return (
-          element.textContent.trim() === labelText &&
-          button &&
-          !button.disabled &&
-          !isSuppressed(button)
-        );
-      },
+  function findButton(labelText) {
+    const expectedLabel = normalizeText(labelText);
+
+    for (const button of document.querySelectorAll("button")) {
+      const names = [
+        button.getAttribute("aria-label"),
+        button.getAttribute("title"),
+        button.textContent,
+      ]
+        .map(normalizeText)
+        .filter(Boolean);
+
+      if (names.includes(expectedLabel) && isEnabledActionElement(button)) {
+        return button;
+      }
+    }
+
+    for (const label of document.querySelectorAll("span.Hidden")) {
+      if (normalizeText(label.textContent) !== expectedLabel) continue;
+
+      const actionElement =
+        label.closest('button, [role="button"]') ||
+        (expectedLabel === normalizeText("プロフィールを開く")
+          ? label.parentElement
+          : null);
+
+      if (isEnabledActionElement(actionElement)) return actionElement;
+    }
+
+    return null;
+  }
+
+  function clearProfileOpenFallbackState() {
+    profileOpenMissingSince = 0;
+    profileLoadingConsecutiveCount = 0;
+    fallbackClickedAriaLabels.clear();
+  }
+
+  function getExploreCategoryButtons() {
+    // 見出し文言やsection数に依存せず、表示順に全カテゴリーを取得。
+    return [
+      ...document.querySelectorAll("#catalog-page button[aria-label]"),
+    ].filter(
+      (button) => button.querySelector("h3") && isEnabledActionElement(button),
+    );
+  }
+
+  function getExploreCategoryLabel(button) {
+    const heading = button.querySelector("h3");
+    if (heading && normalizeText(heading.textContent)) {
+      return heading.textContent.trim();
+    }
+
+    return String(button.getAttribute("aria-label") || "")
+      .replace(/\s+-\s+.*$/, "")
+      .trim();
+  }
+
+  function getCurrentExploreCategoryLabel(buttons) {
+    const current = buttons.find(
+      (button) => button.getAttribute("aria-current") === "page",
+    );
+    if (current) return getExploreCategoryLabel(current);
+    return document.querySelector("main nav h2")?.textContent.trim() || "";
+  }
+
+  function clickNextExploreCategory() {
+    const buttons = getExploreCategoryButtons();
+    if (!buttons.length) return null;
+
+    const state = readCategoryRotation();
+    const currentLabel =
+      getCurrentExploreCategoryLabel(buttons) || state.lastLabel;
+    const currentIndex = buttons.findIndex(
+      (button) => getExploreCategoryLabel(button) === currentLabel,
+    );
+    let nextIndex = buttons.findIndex(
+      (button) => getExploreCategoryLabel(button) === state.pendingLabel,
+    );
+    if (nextIndex < 0) nextIndex = (currentIndex + 1) % buttons.length;
+
+    const button = buttons[nextIndex];
+    const categoryLabel = getExploreCategoryLabel(button);
+    button.click();
+    saveCategoryRotation({
+      lastLabel: categoryLabel,
+      waitingUntil: Date.now() + CONFIG.categoryTransitionWaitMs,
+    });
+    profileIdsInCurrentCategory.clear();
+    lastProcessedProfileId = null;
+    clearProfileOpenFallbackState();
+    return categoryLabel;
+  }
+
+  function isRendered(element) {
+    return !isSuppressed(element) && element.getClientRects().length > 0;
+  }
+
+  function findEmptyExploreState() {
+    // 本文の自己紹介には反応せず、終了ダイアログの見出しと
+    // プロフィールカード内の既知の終了案内のみを調べる。
+    const dialogs = [...document.querySelectorAll('main [role="dialog"]')];
+    const dialog = dialogs.find(
+      (element) =>
+        isRendered(element) &&
+        [...element.querySelectorAll("h1, h2, h3")].some((heading) =>
+          normalizeText(heading.textContent).includes(
+            "近くに新しいメンバーはいないみたい",
+          ),
+        ),
+    );
+    if (dialog) return dialog;
+    return (
+      [
+        ...document.querySelectorAll(
+          'main [aria-label="プロフィールカード"] div',
+        ),
+      ].find(
+        (element) =>
+          element.children.length === 0 &&
+          isRendered(element) &&
+          normalizeText(element.textContent).startsWith(
+            "まわりにメンバーがもういないみたい",
+          ),
+      ) || null
+    );
+  }
+
+  function handleEmptyExploreState(decisionCount) {
+    const state = readCategoryRotation();
+    if (Date.now() < (state.waitingUntil || 0)) {
+      return {
+        status: "waiting",
+        message: "カテゴリーの切り替え待ちです",
+        decisionCount,
+      };
+    }
+    const emptyState = findEmptyExploreState();
+    if (!emptyState && !state.pendingLabel && !state.returningToExplore)
+      return null;
+
+    // モーダルがある場合は、先に閉じてから次回のステップで移動。
+    const returnButton =
+      emptyState &&
+      [...emptyState.querySelectorAll("button")].find(
+        (button) =>
+          isEnabledActionElement(button) &&
+          normalizeText(button.textContent) === "exploreに戻る",
+      );
+    if (returnButton) {
+      const buttons = getExploreCategoryButtons();
+      const currentLabel =
+        getCurrentExploreCategoryLabel(buttons) || state.lastLabel;
+      const currentIndex = buttons.findIndex(
+        (button) => getExploreCategoryLabel(button) === currentLabel,
+      );
+      const nextButton = buttons[(currentIndex + 1) % buttons.length];
+      returnButton.click();
+      saveCategoryRotation({
+        lastLabel: currentLabel,
+        pendingLabel: nextButton
+          ? getExploreCategoryLabel(nextButton)
+          : state.pendingLabel,
+        returningToExplore: true,
+        waitingUntil: Date.now() + CONFIG.categoryTransitionWaitMs,
+      });
+      return {
+        status: "returned-to-explore",
+        message: "メンバーがいないためExploreに戻りました",
+        decisionCount,
+      };
+    }
+
+    const clickedCategory = clickNextExploreCategory();
+    return clickedCategory
+      ? {
+          status: "clicked-explore-category",
+          trigger: "no-members",
+          message: `メンバーがいないため「${clickedCategory}」へ切り替えました`,
+          clickedCategory,
+          decisionCount,
+        }
+      : {
+          status: "waiting",
+          message: "次のカテゴリー一覧の表示待ちです",
+          decisionCount,
+        };
+  }
+
+  function isVisibleActionElement(element) {
+    if (
+      element.disabled ||
+      element.getAttribute("aria-disabled") === "true" ||
+      isSuppressed(element)
+    ) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const viewportHeight =
+      window.innerHeight || document.documentElement.clientHeight;
+
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.bottom > 0 &&
+      rect.top < viewportHeight
+    );
+  }
+
+  function isExcludedFallbackLabel(label) {
+    const excludedLabels = new Set([
+      "ブースト",
+      "previous photo",
+      "次の写真",
+      "nope",
+      "super like",
+      "like",
+      "ファーストリアクション",
+      "閉じる",
+      "結構です",
+      "super likeを送ろう",
+    ]);
+
+    return (
+      excludedLabels.has(label) ||
+      label.includes(normalizeText("プロフィールを開く"))
+    );
+  }
+
+  function clickNextAriaLabelFallback() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(
+      (dialog) => !isSuppressed(dialog),
+    );
+    const profileCard = document.querySelector(
+      'main [aria-label="プロフィールカード"]',
+    );
+    const searchRoot =
+      dialogs.length > 0 ? dialogs[dialogs.length - 1] : profileCard;
+
+    if (!searchRoot) return null;
+
+    const candidates = [
+      ...searchRoot.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label], input[aria-label]',
+      ),
+    ]
+      .map((element, documentOrder) => ({
+        element,
+        documentOrder,
+        label: normalizeText(element.getAttribute("aria-label")),
+        rect: element.getBoundingClientRect(),
+      }))
+      .filter(
+        ({ element, label }) =>
+          label &&
+          !fallbackClickedAriaLabels.has(label) &&
+          !isExcludedFallbackLabel(label) &&
+          isVisibleActionElement(element),
+      )
+      .sort(
+        (left, right) =>
+          left.rect.top - right.rect.top ||
+          left.rect.left - right.rect.left ||
+          left.documentOrder - right.documentOrder,
+      );
+
+    const candidate = candidates[0];
+    if (!candidate) return null;
+
+    fallbackClickedAriaLabels.add(candidate.label);
+    candidate.element.click();
+    return candidate.label;
+  }
+
+  function handleMissingProfileOpenButton(decisionCount) {
+    const now = Date.now();
+
+    if (profileOpenMissingSince === 0) {
+      profileOpenMissingSince = now;
+    }
+
+    const waitingMs = now - profileOpenMissingSince;
+    const tinderIsLoading = Boolean(
+      document.querySelector(
+        'main [aria-label="プロフィールカード"] [aria-busy="true"]',
+      ),
     );
 
-    return label?.closest("button") || null;
+    if (tinderIsLoading) {
+      profileLoadingConsecutiveCount += 1;
+
+      if (
+        profileLoadingConsecutiveCount >= CONFIG.profileLoadingRotationThreshold
+      ) {
+        const loadingConsecutiveCount = profileLoadingConsecutiveCount;
+        const clickedCategory = clickNextExploreCategory();
+
+        if (clickedCategory) {
+          profileLoadingConsecutiveCount = 0;
+          profileOpenMissingSince = now;
+          fallbackClickedAriaLabels.clear();
+
+          return {
+            status: "clicked-explore-category",
+            message:
+              `プロフィール読み込みが${loadingConsecutiveCount}回続いたため` +
+              `「${clickedCategory}」へ切り替えました`,
+            clickedCategory,
+            loadingConsecutiveCount,
+            decisionCount,
+          };
+        }
+      }
+
+      return {
+        status: "waiting",
+        message: "Tinder側でプロフィールを読み込んでいます",
+        loadingConsecutiveCount: profileLoadingConsecutiveCount,
+        waitingMs,
+        decisionCount,
+      };
+    }
+
+    profileLoadingConsecutiveCount = 0;
+
+    if (waitingMs >= CONFIG.profileOpenFallbackAfterMs) {
+      const clickedLabel = clickNextAriaLabelFallback();
+
+      if (clickedLabel) {
+        return {
+          status: "clicked-aria-fallback",
+          message: `プロフィール待機が5秒続いたため「${clickedLabel}」を押しました`,
+          clickedAriaLabel: clickedLabel,
+          waitingMs,
+          decisionCount,
+        };
+      }
+
+      const clickedCategory = clickNextExploreCategory();
+
+      if (clickedCategory) {
+        profileOpenMissingSince = now;
+        fallbackClickedAriaLabels.clear();
+
+        return {
+          status: "clicked-explore-category",
+          message:
+            `プロフィール操作が${Math.round(waitingMs / 1000)}秒見つからないため` +
+            `「${clickedCategory}」へ切り替えました`,
+          trigger: "missing-profile-open-button",
+          clickedCategory,
+          waitingMs,
+          decisionCount,
+        };
+      }
+    }
+
+    return {
+      status: "waiting",
+      message: "操作可能な「プロフィールを開く」が見つかりません",
+      waitingMs,
+      decisionCount,
+    };
+  }
+
+  function findLikeUpgradeDismissButton() {
+    const expectedTitle = normalizeText("Likeをアップグレードしよう！");
+
+    for (const dialog of document.querySelectorAll('[role="dialog"]')) {
+      if (isSuppressed(dialog)) continue;
+
+      const isLikeUpgradeDialog = [
+        ...dialog.querySelectorAll("h1, h2, h3"),
+      ].some((heading) => normalizeText(heading.textContent) === expectedTitle);
+
+      if (!isLikeUpgradeDialog) continue;
+
+      const dismissButton = [...dialog.querySelectorAll("button")].find(
+        (button) =>
+          !button.disabled &&
+          !isSuppressed(button) &&
+          normalizeText(button.textContent) === normalizeText("結構です"),
+      );
+
+      if (dismissButton) return dismissButton;
+    }
+
+    return null;
   }
 
   function appendLog(entry) {
@@ -283,13 +792,21 @@
         sessionStorage.getItem(STORAGE.decisions) || "0",
       );
 
-      if (decisionCount >= CONFIG.maxProfiles) {
+      const likeUpgradeDismissButton = findLikeUpgradeDismissButton();
+
+      if (likeUpgradeDismissButton) {
+        likeUpgradeDismissButton.click();
+
         return {
-          status: "limit",
-          message: `上限${CONFIG.maxProfiles}人に到達しました`,
+          status: "dismissed-like-upgrade",
+          message: "Likeアップグレード画面で「結構です」を押しました",
           decisionCount,
         };
       }
+
+      // 終了画面は、背後に残っているプロフィールより先に処理する。
+      const categoryResult = handleEmptyExploreState(decisionCount);
+      if (categoryResult) return categoryResult;
 
       const profile = getOpenedProfile();
 
@@ -298,12 +815,10 @@
         const openButton = findButton("プロフィールを開く");
 
         if (!openButton) {
-          return {
-            status: "waiting",
-            message: "操作可能な「プロフィールを開く」が見つかりません",
-          };
+          return handleMissingProfileOpenButton(decisionCount);
         }
 
+        clearProfileOpenFallbackState();
         openButton.click();
 
         return {
@@ -312,6 +827,8 @@
           decisionCount,
         };
       }
+
+      clearProfileOpenFallbackState();
 
       if (!hasDetailMarkers(profile)) {
         return {
@@ -333,16 +850,94 @@
         };
       }
 
-      const seenProfiles = new Set(readJsonArray(STORAGE.seen));
+      const isConsecutiveProfile = lastProcessedProfileId === profileId;
+      const isRepeatedInCategory = profileIdsInCurrentCategory.has(profileId);
+
+      if (isConsecutiveProfile || isRepeatedInCategory) {
+        const clickedCategory = clickNextExploreCategory();
+        const trigger = isConsecutiveProfile
+          ? "consecutive-profile-id"
+          : "repeated-profile-id-cycle";
+        const repetitionMessage = isConsecutiveProfile
+          ? "同じプロフィールIDが続いたため"
+          : "現在のカテゴリ内でプロフィールIDが繰り返されたため";
+
+        if (clickedCategory) {
+          return {
+            status: "clicked-explore-category",
+            message: `${repetitionMessage}「${clickedCategory}」へ切り替えました`,
+            trigger,
+            clickedCategory,
+            profileId,
+            profileName,
+            decisionCount,
+          };
+        }
+
+        // 切り替え先がない場合も、以下のプロフィール判定へ進む。
+        // 重複検知だけで待機し続けないよう、このカテゴリの巡回履歴を更新する。
+        profileIdsInCurrentCategory.clear();
+      }
+
+      const seenProfiles = new Set(readSeenProfiles());
 
       if (seenProfiles.has(profileId)) {
-        return {
-          status: "duplicate",
-          message: "判定済みのプロフィールです",
+        const profileText = getProfileText(profile);
+        const lineMentionDetected = containsLineMention(profileText);
+        const distanceKm = getDistances(profile)[0] ?? null;
+        const reasonLabels = ["判定済み"];
+
+        if (lineMentionDetected) {
+          reasonLabels.push("LINE誘導あり（許可）");
+        }
+
+        const button = findButton("Like");
+
+        if (!button) {
+          return {
+            status: "waiting",
+            message: "判定済みプロフィールのLikeボタンが見つかりません",
+            profileId,
+            profileName,
+            decisionCount,
+          };
+        }
+
+        const nextCount = decisionCount + 1;
+        const result = {
+          status: "clicked-like",
+          action: "Like",
+          ...createDecisionLogFields({
+            action: "Like",
+            profileName,
+            distanceKm,
+            reasonLabels,
+          }),
+          distanceKm,
+          lineMentionDetected,
+          ...(lineMentionDetected
+            ? {
+                logNotes: ["LINE誘導あり（許可）"],
+                lineMentionProfile: createLineMentionProfileLog({
+                  profileId,
+                  profileName,
+                  profileText,
+                  distanceKm,
+                }),
+              }
+            : {}),
           profileId,
           profileName,
-          decisionCount,
+          decisionCount: nextCount,
         };
+
+        sessionStorage.setItem(STORAGE.decisions, String(nextCount));
+        appendLog(result);
+
+        lastProcessedProfileId = profileId;
+        profileIdsInCurrentCategory.add(profileId);
+        button.click();
+        return result;
       }
 
       const distances = getDistances(profile);
@@ -359,8 +954,9 @@
       }
 
       const distanceKm = distances[0] ?? null;
+      const profileText = getProfileText(profile);
       const decision = evaluateRules({
-        profileText: getProfileText(profile),
+        profileText,
         distanceKm,
       });
       const button = findButton(decision.action);
@@ -378,11 +974,37 @@
       }
 
       const nextCount = decisionCount + 1;
+      const nopeReasons = decision.reasons.map(formatNopeReason);
+      const reasonLabels =
+        decision.action === "Nope"
+          ? nopeReasons
+          : decision.lineMentionDetected
+            ? ["LINE誘導あり（許可）"]
+            : [];
       const result = {
         status: decision.action === "Nope" ? "clicked-nope" : "clicked-like",
         action: decision.action,
+        ...createDecisionLogFields({
+          action: decision.action,
+          profileName,
+          distanceKm,
+          reasonLabels,
+        }),
         distanceKm,
         reasons: decision.reasons,
+        lineMentionDetected: decision.lineMentionDetected,
+        ...(decision.lineMentionDetected
+          ? {
+              logNotes: ["LINE誘導あり（許可）"],
+              lineMentionProfile: createLineMentionProfileLog({
+                profileId,
+                profileName,
+                profileText,
+                distanceKm,
+              }),
+            }
+          : {}),
+        ...(nopeReasons.length > 0 ? { nopeReasons } : {}),
         profileId,
         profileName,
         decisionCount: nextCount,
@@ -390,10 +1012,12 @@
 
       // クリック前に保存し、連続実行による二重押下を防止する。
       seenProfiles.add(profileId);
-      sessionStorage.setItem(STORAGE.seen, JSON.stringify([...seenProfiles]));
+      writeSeenProfiles(seenProfiles);
       sessionStorage.setItem(STORAGE.decisions, String(nextCount));
       appendLog(result);
 
+      lastProcessedProfileId = profileId;
+      profileIdsInCurrentCategory.add(profileId);
       button.click();
       return result;
     } catch (error) {
@@ -425,10 +1049,16 @@
 
       const tick = () => {
         this.lastResult = runStep();
-        console.log("[Tinder Auto Judge]", this.lastResult);
 
-        if (this.lastResult.status === "limit") {
-          this.stop();
+        if (this.lastResult.status !== "opened") {
+          if (this.lastResult.summary) {
+            console.log(
+              `[Tinder Auto Judge] ${this.lastResult.summary}`,
+              this.lastResult,
+            );
+          } else {
+            console.log("[Tinder Auto Judge]", this.lastResult);
+          }
         }
       };
 
@@ -448,13 +1078,21 @@
       return {
         running: Boolean(this.timer),
         decisionCount: Number(sessionStorage.getItem(STORAGE.decisions) || "0"),
-        seenProfiles: readJsonArray(STORAGE.seen).length,
+        seenProfiles: readSeenProfiles().length,
         lastResult: this.lastResult,
       };
     },
 
     resetHistory() {
+      try {
+        localStorage.removeItem(STORAGE.seen);
+      } catch {
+        // localStorageを利用できない環境ではsessionStorageのみ消去する。
+      }
       sessionStorage.removeItem(STORAGE.seen);
+      sessionStorage.removeItem(STORAGE.decisions);
+      lastProcessedProfileId = null;
+      profileIdsInCurrentCategory.clear();
       console.log("[Tinder Auto Judge] 判定済み履歴を消去しました");
     },
   };
